@@ -223,8 +223,33 @@ internal sealed unsafe class AudioTrack : IDisposable
         _frameIndex++;
         _enc.Encode(pcm, pts, (encPts, data) =>
         {
-            lock (_gate) _frames.Add(new AacFrame(encPts, data));
+            var frame = new AacFrame(encPts, data);
+            lock (_gate) _frames.Add(frame);
+            var tap = _tap;
+            if (tap != null)
+            {
+                try { tap(frame); } catch (Exception ex) { Log.Warn($"Audio '{Name}' tap: {ex.Message}"); }
+            }
         });
+    }
+
+    private Action<AacFrame>? _tap;
+
+    /// <summary>
+    /// Sees every new frame as it is encoded, on the audio thread (the engine's audio gate is held): it must only copy and enqueue. Set and
+    /// cleared under the engine's audio gate, which is what <see cref="AttachTap"/> relies on.
+    /// </summary>
+    public Action<AacFrame>? FrameTap { get => Volatile.Read(ref _tap); set => Volatile.Write(ref _tap, value); }
+
+    /// <summary>
+    /// Returns the frames since <paramref name="from"/> and sets <see cref="FrameTap"/>, with no frame lost or repeated between the two:
+    /// the caller holds the lock that serializes this track's producer (the engine's audio gate), so no frame is made in between.
+    /// </summary>
+    public List<AacFrame> AttachTap(long from, Action<AacFrame> tap)
+    {
+        var frames = Snapshot(from, long.MaxValue);
+        FrameTap = tap;
+        return frames;
     }
 
     public void Trim(long olderThan)

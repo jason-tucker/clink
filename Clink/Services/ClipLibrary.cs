@@ -20,6 +20,8 @@ internal sealed class ClipEntry
     public string? SourcePath { get; set; }
     /// <summary>Set when the archive service moved the file to the archive location (<see cref="Path"/> then points there).</summary>
     public DateTime? ArchivedAt { get; set; }
+    /// <summary>A manual recording, not a clip (hours long): "share last" and "trim last" skip it. Missing in older indexes: false.</summary>
+    public bool IsRecording { get; set; }
 
     [JsonIgnore] public bool IsShared => !string.IsNullOrEmpty(CopiumLink);
     [JsonIgnore] public bool IsArchived => ArchivedAt != null;
@@ -108,11 +110,12 @@ internal sealed class ClipLibrary
     }
 
     /// <param name="isTrim">Made by the trim editor; <paramref name="sourcePath"/> is the clip it was cut from.</param>
-    public ClipEntry Add(string path, double duration, long size, string? game, string[] audioTracks, bool isTrim = false, string? sourcePath = null)
+    public ClipEntry Add(string path, double duration, long size, string? game, string[] audioTracks, bool isTrim = false, string? sourcePath = null, bool isRecording = false)
     {
         var e = new ClipEntry
         {
             Path = path, Created = DateTime.Now, Duration = duration, Size = size, Game = game, AudioTracks = audioTracks,
+            IsRecording = isRecording,
             IsTrim = isTrim, SourcePath = isTrim ? sourcePath : null,
         };
         lock (_gate)

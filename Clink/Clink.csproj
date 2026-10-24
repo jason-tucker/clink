@@ -16,7 +16,7 @@
     <RootNamespace>Clink</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\clink.ico</ApplicationIcon>
-    <Version>0.2.6</Version>
+    <Version>0.3.0</Version>
     <!-- GitHub "owner/repo" the app checks for updates. Empty = updates off; CI passes -p:UpdateRepo=owner/repo -p:Version=X.Y.Z -->
     <UpdateRepo Condition="'$(UpdateRepo)' == ''"></UpdateRepo>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>

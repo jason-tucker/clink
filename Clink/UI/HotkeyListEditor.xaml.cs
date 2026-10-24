@@ -18,6 +18,7 @@ public partial class HotkeyListEditor : UserControl
     private static readonly (string label, string value)[] s_actions =
     {
         ("Clip", "clip"), ("Pause / resume", "pause"), ("Share last clip", "share-last"),
+        ("Start / stop recording", "record"),
     };
     private static readonly int[] s_lengths = { 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300, 600, 900, 1200, 1800, 2700, 3600 };
     private static readonly int[] s_newLengths = { 30, 15, 10, 5 };   // what "Add hotkey" starts on: the longest of these that is shorter than the replay
@@ -201,7 +202,7 @@ public partial class HotkeyListEditor : UserControl
         grid.Children.Add(keys);
 
         var oneLine = TryFindResource("OneLine") as DataTemplate;
-        var action = new ComboBox { Margin = new Thickness(8, 0, 0, 0), Width = 128, ToolTip = "What the keys do", ItemTemplate = oneLine };
+        var action = new ComboBox { Margin = new Thickness(8, 0, 0, 0), Width = 156, ToolTip = "What the keys do", ItemTemplate = oneLine };
         action.ItemsSource = s_actions.Select(x => new Choice(x.label, x.value)).ToArray();
         action.SelectedItem = ((Choice[])action.ItemsSource).FirstOrDefault(c => string.Equals((string)c.Value, Normalize(a.Action), StringComparison.OrdinalIgnoreCase)) ?? ((Choice[])action.ItemsSource)[0];
         Grid.SetColumn(action, 1);

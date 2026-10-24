@@ -59,6 +59,20 @@ internal sealed class Toasts
         Add(new ToastWindow(this, "recording", null, null, "Recording started", game, Duration(_settings.ToastRecording), false));
     });
 
+    /// <summary>"Recording started" for a manual recording (kind "record", red dot; <see cref="ShowRecordingStarted"/> is the replay buffer). Follows the "Recording" switch.</summary>
+    public void ShowRecordStarted(string text) => Post(() =>
+    {
+        if (!_settings.ToastRecording.Enabled) return;
+        Add(new ToastWindow(this, "record", null, null, "Recording started", text, Duration(_settings.ToastRecording), false));
+    });
+
+    /// <summary>"Recording saved" with its length and size (kind "recorded", green dot). Follows the "Recording" switch.</summary>
+    public void ShowRecordSaved(string text) => Post(() =>
+    {
+        if (!_settings.ToastRecording.Enabled) return;
+        Add(new ToastWindow(this, "recorded", null, null, "Recording saved", text, Duration(_settings.ToastRecording), false));
+    });
+
     /// <summary>
     /// A plain title + line toast in the "Recording started" layout ("Recording paused"); the caller decides whether it is wanted.
     /// The dot is grey when <paramref name="paused"/> (as the status dot), accent otherwise: red stays "recording" / error.
@@ -205,7 +219,7 @@ public partial class ToastWindow : Window, ICaptureExcludedWindow
         TitleText.Text = Toasts.TitleFor(title);
         Subtitle.Text = subtitle;
         Subtitle.ToolTip = subtitle;
-        Dot.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, kind switch { "shared" or "info" => "Accent", "recording" => "Danger", "problem" => "Warn", "paused" => "Muted", _ => "Good" });
+        Dot.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, kind switch { "shared" or "info" => "Accent", "recording" or "record" => "Danger", "problem" => "Warn", "paused" => "Muted", _ => "Good" });
         if (kind == "problem") Subtitle.TextWrapping = TextWrapping.Wrap;   // the reason is the point: all of it, not an ellipsis
         ClipButtons.Visibility = kind == "clip" ? Visibility.Visible : Visibility.Collapsed;
         SharedButtons.Visibility = kind == "shared" ? Visibility.Visible : Visibility.Collapsed;

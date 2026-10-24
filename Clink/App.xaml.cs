@@ -218,6 +218,9 @@ public partial class App : System.Windows.Application
         UI.ThemeManager.Apply(settings.Theme, settings.Accent);
 
         _controller = new AppController(settings, updater);
+        // Windows signing out / shutting down: finish a manual recording (up to ~4 s) before the process is ended, so its file is
+        // complete. (Not final: another program may still cancel the session end.)
+        SessionEnding += (_, _) => _controller?.StopRecordingForExit(final: false);
         var main = new MainWindow();
         if (dev != null) main.Title = "Clink (dev)";
         MainWindow = main;
@@ -234,6 +237,7 @@ public partial class App : System.Windows.Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        _controller?.StopRecordingForExit();   // the common exit finishes the file here, not in Dispose's 15 s wait
         _controller?.Dispose();
         base.OnExit(e);
     }

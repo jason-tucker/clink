@@ -23,7 +23,7 @@ internal enum RecordingState { Starting, Recording, WaitingForGame, Paused, Erro
 internal enum ShareOutcome { None, LinkCopied, Uploaded, FileShareOpened, Refused, Failed, WindowFailed }
 
 /// <summary>Owns the engine, settings, clip library, hotkeys, game detection, toasts, status dot, archive, tray icon and the single-instance pipe.</summary>
-internal sealed class AppController : IDisposable
+internal sealed partial class AppController : IDisposable
 {
     /// <summary>
     /// Appended to the mutex and pipe names so a "--dev" instance runs next to the real one without ever seeing its commands:
@@ -97,10 +97,15 @@ internal sealed class AppController : IDisposable
         }
     }
 
-    /// <summary>One line for the UI header: "Recording · Overwatch", "Waiting for a game…", "Paused", "Error", "Starting…".</summary>
+    /// <summary>A manual recording (start / stop) is going: the status dot is red and the status line counts its time. Not the replay buffer.</summary>
+    public bool IsManualRecording => !IsPaused && (Engine.IsRecording || _wantRecording);
+
+    /// <summary>One line for the UI header: "Recording · Overwatch", "Recording 00:12 · Overwatch" (manual), "Waiting for a game…", "Paused", "Error", "Starting…".</summary>
     public string StatusText => State switch
     {
         RecordingState.Paused => "Paused",
+        _ when _wantRecording && !Engine.IsRecording => "Recording (resuming…)",   // between two parts of a recording
+        RecordingState.Recording when IsManualRecording && Engine.Recording is { } rec => RecordingPolicy.StatusLine(rec.Seconds, CurrentGame),
         RecordingState.Recording => CurrentGame != null ? $"Recording · {CurrentGame}" : "Recording",
         RecordingState.WaitingForGame => "Waiting for a game…",
         RecordingState.Error => "Error",
@@ -146,6 +151,22 @@ internal sealed class AppController : IDisposable
     private string _trayText = "";
     private string? _hotkeyNotice;          // said once at start when the main hotkey was claimed for Alt+C or left unset (MigrateHotkeys)
     private bool _importOffered, _importAccepted;   // another copy's settings were offered in a balloon (once per start); --dev-accept-import has acted
+    private bool _wantRecording;            // the user started a manual recording and has not stopped it (UI thread): a technical end continues it as a new part
+    private EngineStopCause _stopCause;     // why the controller stopped the engine under a recording (UI thread); consumed by OnRecordingEnded
+    private bool _settingsRestartPending;   // a settings change wanted an engine restart while recording: applied when the recording ends
+    private bool _exiting;                  // Quit / session end: StopRecordingForExit has run
+    private DateTime _lastRecordToggleAt = DateTime.MinValue;
+    private int _recordingGen;              // bumped by every start / stop request: a part-continuation loop of an older wish gives up
+    private int _engineRunGen;              // bumped each time a start of the engine completes with the engine running: a part waits for a newer run than the one it ended with
+    private int _partRunGen;                // _engineRunGen when the recording that is going (or ended last) started
+    private DateTime _technicalRestartUntil = DateTime.MinValue; // a display change / resume is on its way to restarting the engine until this time (UI thread): no part starts on the old engine
+    private DateTime _recordWhenReadyUntil = DateTime.MinValue;   // a start asked for while the recorder was not ready (or --record at launch) is acted on until this time
+    private bool _autoPart;                 // the recording that is going (or ended last) was started by the controller as a continuation, not by the user
+    private int _emptyAutoParts;            // automatic parts in a row that recorded nothing
+    private bool _finishing;                // the user stopped the recording and its file is being finished
+    private readonly object _recoverGate = new();   // one RecoverRecordings pass at a time (a folder change during the startup pass)
+    private System.Windows.Forms.ToolStripMenuItem? _recordItem;
+    private static readonly TimeSpan ExitStopLimit = TimeSpan.FromSeconds(4);
 
     public AppController(Settings settings, Updater updater)
     {
@@ -177,6 +198,7 @@ internal sealed class AppController : IDisposable
         args.Any(a => a.Equals("--clip", StringComparison.OrdinalIgnoreCase)) ? "clip"
         : args.Any(a => a.Equals("--trim-last", StringComparison.OrdinalIgnoreCase)) ? "trim"
         : args.Any(a => a.Equals("--share-last", StringComparison.OrdinalIgnoreCase)) ? "share"
+        : args.Any(a => a.Equals("--record", StringComparison.OrdinalIgnoreCase)) ? "record"   // toggles a manual recording (to a running Clink; a start finds the recorder not up yet and says so)
         : null;
 
     /// <summary>
@@ -281,6 +303,7 @@ internal sealed class AppController : IDisposable
             case "show": ShowRequested?.Invoke(); break;
             case "trim": TrimLastRequested?.Invoke(); break;
             case "share": ShareLast(); break;
+            case "record": ToggleRecording(); break;
             case "pause": if (!IsPaused) TogglePause(); break;
             case "resume": if (IsPaused) TogglePause(); break;
             default: Log.Warn("pipe: unknown command " + (cmd.Length > 40 ? cmd[..40] + "…" : cmd)); break;
@@ -294,6 +317,7 @@ internal sealed class AppController : IDisposable
     /// </summary>
     internal void RunStartupCommand(string cmd)
     {
+        if (cmd == "record") { QueueRecordingAtLaunch(); return; }
         if (cmd != "clip") { _ui.BeginInvoke(DispatcherPriority.ApplicationIdle, () => RunCommand(cmd)); return; }
         // Marked now, not at idle: a --share-last sent right behind this --clip can reach the pipe while Clink is still starting.
         _clipRefusedAt = DateTime.UtcNow;
@@ -326,6 +350,10 @@ internal sealed class AppController : IDisposable
         // window's codec list and the first engine start find the answer ready instead of probing on the UI thread.
         Task.Run(() => { try { _ = Capabilities.Codecs; } catch (Exception ex) { Log.Warn("codec probe: " + ex.Message); } });
         Engine.StateChanged += () => _ui.BeginInvoke(RaiseStateChanged);
+        // Once, for the one engine this controller owns. Raised on the recorder's thread: only ever BeginInvoke here (an Invoke
+        // would deadlock against a UI thread that waits for the recording to finish: StopRecordingForExit, Engine.Dispose).
+        Engine.RecordingStopped += result => { try { _ui.BeginInvoke(() => OnRecordingEnded(result)); } catch (Exception ex) { Log.Warn("recording end: " + ex.Message); } };
+        RecoverRecordingsAsync();
         _ = PipeServerAsync(_cts.Token);
         CreateTray();
         _timer = new DispatcherTimer(TimeSpan.FromSeconds(1), DispatcherPriority.Background, (_, _) => Tick(), _ui);
@@ -376,7 +404,7 @@ internal sealed class AppController : IDisposable
             if (_gameStopAt is DateTime t && now >= t)
             {
                 _gameStopAt = null;
-                if (_gamePid == 0 && Engine.IsRunning) { Log.Info("No game running, stopping the recorder"); StopEngine(); }
+                if (_gamePid == 0 && Engine.IsRunning) { Log.Info("No game running, stopping the recorder"); EndRecordingWish(EngineStopCause.GameEnded); StopEngine(); }
             }
         }
         // A recorder that should be running but is not: the mode was just switched, a start failed (encoder sessions taken by
@@ -384,6 +412,13 @@ internal sealed class AppController : IDisposable
         // after a start that stopped without an error, 30 s / 30 s / 1 min / 2 min while starts keep failing; after a GPU reset
         // (driver crash / TDR, Engine.DeviceLost) a third of that, so recording resumes on a fresh device as soon as the driver
         // is back. StartEngine raises one notice per failure streak (NotifyProblem).
+        if (_recordWhenReadyUntil != DateTime.MinValue && now >= _recordWhenReadyUntil)
+        {
+            // A start asked for while the recorder was not ready expired unfired (every other path resets it to MinValue).
+            _recordWhenReadyUntil = DateTime.MinValue;
+            Say("Recording not started: the recorder did not get ready");
+            NotifyProblem("Recording not started", "The recorder did not get ready");
+        }
         bool wanted = !IsPaused && !_restarting && (!GameOnly || _gamePid != 0);
         int failedWait = Engine.DeviceLost ? 10 : 30;
         var backoff = TimeSpan.FromSeconds(Engine.Error == null ? 10 : failedWait << Math.Clamp(_startFailures - 1, 0, 2));
@@ -659,6 +694,7 @@ internal sealed class AppController : IDisposable
     private void StopForRestart()
     {
         _restarting = true;
+        EndRecordingWish(EngineStopCause.Shutdown);
         Settings.FreezeSaves();
         Library.FreezeSaves();
         Interlocked.Increment(ref _startGen);   // a recorder start that has not begun is cancelled
@@ -720,7 +756,7 @@ internal sealed class AppController : IDisposable
     /// </summary>
     internal static List<string> RestartArguments(IEnumerable<string> args)
     {
-        var once = new[] { "--clip", "--trim-last", "--share-last", "--minimized", "--no-update" };
+        var once = new[] { "--clip", "--trim-last", "--share-last", "--record", "--minimized", "--no-update" };
         var kept = WithoutAfterPid(DevOptions.WithoutSwitches(args)).Where(a => !once.Contains(a, StringComparer.OrdinalIgnoreCase)).ToList();
         if (!kept.Contains("--show", StringComparer.OrdinalIgnoreCase)) kept.Add("--show");
         kept.AddRange(DevSwitches());
@@ -731,11 +767,13 @@ internal sealed class AppController : IDisposable
     {
         _ui.BeginInvoke(async () =>
         {
+            BeginTechnicalRestart(TimeSpan.FromMilliseconds(1500));   // at once, not after the delay: a recording that ends in between must not start its next part on the old engine
             await Task.Delay(1500);
             RefreshTrayIcon();   // a DPI change moves the tray's and the taskbar buttons' icon sizes
             AppIcons.RefreshWindows();
             Monitors = Native.Monitors.Enumerate();
             Say("Display changed, restarting capture");
+            MarkTechnicalRestart();
             StartEngine();
             ApplyStatusDot();
         });
@@ -744,7 +782,8 @@ internal sealed class AppController : IDisposable
     private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
     {
         // Monitor handles can change across sleep (a monitor that did not wake up, a dock): restart on fresh ones.
-        if (e.Mode == PowerModes.Resume) _ui.BeginInvoke(async () => { await Task.Delay(3000); Monitors = Native.Monitors.Enumerate(); StartEngine(); });
+        if (e.Mode == PowerModes.Suspend) _ui.BeginInvoke(MarkTechnicalRestart);
+        if (e.Mode == PowerModes.Resume) _ui.BeginInvoke(async () => { BeginTechnicalRestart(TimeSpan.FromMilliseconds(3000)); await Task.Delay(3000); Monitors = Native.Monitors.Enumerate(); MarkTechnicalRestart(); StartEngine(); });
     }
 
     public MonitorInfo? SelectedMonitor =>
@@ -805,14 +844,16 @@ internal sealed class AppController : IDisposable
     /// </summary>
     public void StartEngine()
     {
+        _technicalRestartUntil = DateTime.MinValue;   // the restart that was waited for is here (or will not come: paused, restarting)
         if (IsPaused || _restarting) return;   // a restart is under way: the recorder was stopped for it and stays stopped
         if (GameOnly && _gamePid == 0)
         {
-            if (Engine.IsRunning) StopEngine();
+            if (Engine.IsRunning) { EndRecordingWish(EngineStopCause.GameEnded); StopEngine(); }
             RaiseStateChanged();
             return;
         }
         int gen = Interlocked.Increment(ref _startGen);
+        _settingsRestartPending = false;   // this start reads the settings as they are now
         _lastStartAt = DateTime.UtcNow;   // also when the config fails: Tick retries on its backoff, not every second
         EngineConfig cfg;
         try { cfg = BuildConfig(); }
@@ -849,7 +890,12 @@ internal sealed class AppController : IDisposable
                 {
                     // Only the newest start reports: a superseded one would show an older start's error.
                     _starting = false;
-                    if (Engine.IsRunning) _startFailures = 0;
+                    if (Engine.IsRunning)
+                    {
+                        _startFailures = 0;
+                        _engineRunGen++;
+                        StartQueuedRecording();
+                    }
                     else if (Engine.Error != null)
                     {
                         Say("Recording failed: " + Engine.Error);
@@ -891,7 +937,7 @@ internal sealed class AppController : IDisposable
     public void TogglePause()
     {
         IsPaused = !IsPaused;
-        if (IsPaused) { StopEngine(); Say("Recording paused"); }
+        if (IsPaused) { EndRecordingWish(EngineStopCause.Pause); StopEngine(); Say("Recording paused"); }
         else
         {
             Say(GameOnly && _gamePid == 0 ? "Recording resumed: waiting for a game" : "Recording resumed");
@@ -913,7 +959,8 @@ internal sealed class AppController : IDisposable
     private void RaiseStateChanged()
     {
         UpdateTray();
-        if (_dot != null && Settings.StatusDot) { try { _dot.Apply(State); } catch { } }
+        if (_recordItem != null) _recordItem.Text = RecordItemText;
+        if (_dot != null && Settings.StatusDot) { try { _dot.Apply(State, IsManualRecording); } catch { } }
         StateChanged?.Invoke();
     }
 
@@ -971,6 +1018,7 @@ internal sealed class AppController : IDisposable
                     Toasts.ShowNotice(IsPaused ? "Recording paused" : "Recording resumed", IsPaused ? $"Press {a.Keys} to resume" : GameOnly ? "Waiting for a game" : "Replay buffer restarted", paused: IsPaused);
                 break;
             case "share-last": case "share": ShareLast(); break;
+            case "record": ToggleRecording(); break;
             default: ClipNow(a.Seconds > 0 ? a.Seconds : null); break;
         }
     }
@@ -1059,7 +1107,7 @@ internal sealed class AppController : IDisposable
             Log.Info("share-last: the clip just pressed was not saved; nothing shared");
             return;
         }
-        else entry = Library.Entries.FirstOrDefault(e => e.IsShared || e.IsArchived || e.Exists);
+        else entry = Library.Entries.FirstOrDefault(e => !IsRecordingEntry(e) && (e.IsShared || e.IsArchived || e.Exists));   // (a recording is hours long: not what "share last clip" means)
         bool ok = false, joined = false, windowOpened = false;
         if (entry == null) Say("No clips to share yet");
         else
@@ -1302,7 +1350,7 @@ internal sealed class AppController : IDisposable
         {
             if (!Settings.StatusDot) { _dot?.Hide(); return; }
             _dot ??= new StatusDotWindow();
-            _dot.Apply(State);
+            _dot.Apply(State, IsManualRecording);
             _dot.Place(SelectedMonitor, Settings.StatusDotPosition);
         }
         catch (Exception ex) { Log.Warn("status dot: " + ex.Message); }
@@ -1323,6 +1371,8 @@ internal sealed class AppController : IDisposable
             menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
             _clipItem = new System.Windows.Forms.ToolStripMenuItem(ClipTrayText, null, (_, _) => _ui.BeginInvoke(() => ClipNow()));
             menu.Items.Add(_clipItem);
+            _recordItem = new System.Windows.Forms.ToolStripMenuItem(RecordItemText, null, (_, _) => _ui.BeginInvoke(ToggleRecording));
+            menu.Items.Add(_recordItem);
             menu.Items.Add("Share last clip", null, (_, _) => _ui.BeginInvoke(ShareLast));
             menu.Items.Add("Show Clink", null, (_, _) => ShowRequested?.Invoke());
             _pauseItem = new System.Windows.Forms.ToolStripMenuItem(IsPaused ? "Resume recording" : "Pause recording", null, (_, _) => TogglePause());
@@ -1415,7 +1465,7 @@ internal sealed class AppController : IDisposable
         _ui.BeginInvoke(() =>
         {
             // A throw while cleaning up must not leave a process with no tray icon running on.
-            try { Dispose(); }
+            try { StopRecordingForExit(); Dispose(); }
             finally { System.Windows.Application.Current.Shutdown(); }
         });
     }
@@ -1436,6 +1486,7 @@ internal sealed class AppController : IDisposable
         try { _dot?.Close(); _dot = null; } catch { }
         try { Updater.Dispose(); } catch { }
         try { Engine.Dispose(); } catch { }
+        AddFinishedRecordingOnExit();   // the recording Dispose finished (the 15 s wait): the exit paths that skipped StopRecordingForExit did not add it
         if (_tray != null) { _tray.Visible = false; _tray.Dispose(); _tray = null; }
         try { _trayIcon?.Dispose(); _trayIcon = null; } catch { }
         ReleaseSingleInstance();

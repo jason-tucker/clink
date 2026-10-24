@@ -36,16 +36,25 @@ public partial class StatusDotWindow : Window
         ScreenPlacement.ExcludeFromCapture(new WindowInteropHelper(this).Handle);
     }
 
-    internal void Apply(RecordingState state)
-    {
-        string key = state switch
+    /// <summary>The palette key of the dot for a state: a manual recording is red (Danger) wherever the buffer is running (green).</summary>
+    internal static string KeyFor(RecordingState state, bool manualRecording) =>
+        manualRecording && state == RecordingState.Recording ? "Danger" : state switch
         {
             RecordingState.Recording => "Good",
             RecordingState.Error => "Danger",
             RecordingState.Paused => "Muted",
             _ => "Warn",
         };
+
+    /// <param name="manualRecording">A start / stop recording is going: red with a light ring, which an error (plain red) does not have.</param>
+    internal void Apply(RecordingState state, bool manualRecording = false)
+    {
+        string key = KeyFor(state, manualRecording);
         Dot.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, key);   // a resource reference: the dot follows a theme change
+        bool ring = manualRecording && state == RecordingState.Recording;
+        if (ring) Dot.SetResourceReference(System.Windows.Shapes.Shape.StrokeProperty, "Fg");
+        else Dot.Stroke = new SolidColorBrush(System.Windows.Media.Color.FromArgb(0x80, 0, 0, 0));
+        Dot.StrokeThickness = ring ? 2 : 1;
         Dot.ToolTip = null;
         // Called about once a second: a game going (DXGI) fullscreen, or any always-on-top window shown later, becomes topmost
         // above the dot, so it is put back on top each time (z-order only, never activated).

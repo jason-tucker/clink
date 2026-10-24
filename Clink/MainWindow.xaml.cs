@@ -52,7 +52,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         AppIcons.Attach(this);   // the taskbar button's own icon size, not WPF's default 32 px frame shrunk to it
         _restartTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(700) };
-        _restartTimer.Tick += (_, _) => { _restartTimer.Stop(); _app.StartEngine(); };
+        _restartTimer.Tick += (_, _) => { _restartTimer.Stop(); _app.RequestEngineRestart(); };   // postponed while a recording runs
         _saveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(800) };
         _saveTimer.Tick += (_, _) => { _saveTimer.Stop(); if (!_loading) _app.Settings.Save(); };
         _bannerTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1.5) };
@@ -81,7 +81,8 @@ public partial class MainWindow : Window
             // File.Exists on an archived entry is a share round trip that can stall for the SMB timeout: look on a worker.
             var entries = _app.Library.Entries;
             ClipEntry? newest = null;
-            try { newest = await Task.Run(() => entries.FirstOrDefault(e => e.Exists)); }
+            // (not a recording: hours long, and the trimmer loads its selection into memory; the path test comes first, it costs nothing)
+            try { newest = await Task.Run(() => entries.FirstOrDefault(e => !_app.IsRecordingEntry(e) && e.Exists)); }
             catch (Exception ex) { Log.Warn("trim last: " + ex.Message); }
             if (newest != null) OpenTrim(newest); else _app.Say("No clips to trim yet");
         });
@@ -658,13 +659,7 @@ public partial class MainWindow : Window
         }
         var eng = _app.Engine;
         var state = _app.State;
-        StatusDot.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, state switch
-        {
-            RecordingState.Recording => "Good",
-            RecordingState.Error => "Danger",
-            RecordingState.Paused => "Muted",
-            _ => "Warn",
-        });
+        StatusDot.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, StatusDotWindow.KeyFor(state, _app.IsManualRecording));
         StatusText.Text = _app.StatusText;
 
         bool noticeShowing = DateTime.UtcNow < _noticeUntil;
@@ -1193,6 +1188,7 @@ public partial class MainWindow : Window
         s.ClipsFolder = path;
         s.Save();
         _app.Library.Load(path);
+        _app.RecoverRecordingsAsync();   // unfinished recordings the new folder may hold
         _app.Say("Clips folder changed");
         ScheduleRestart();   // the engine writes clips to its configured folder
     }

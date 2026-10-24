@@ -239,6 +239,21 @@ internal static class HotkeyEditorTests
         Check.Equal("share-last", ed.Actions[1].Action);
     }
 
+    [UnitTest]
+    public static void A_row_can_be_switched_to_start_stop_recording_and_a_saved_record_row_is_kept()
+    {
+        var ed = new HotkeyListEditor();
+        var row = Row(0x79, "pause", 0);
+        ed.Load(new[] { Row(0x43, "clip", 0, alt: true), row, Row(0x7A, "record", 0) }, 45);
+        var kept = (ComboBox)((Grid)ed.Rows.Children[1]).Children[1];
+        Check.Equal("Start / stop recording", kept.SelectedItem?.ToString(), "a saved record row shows its action");
+        Check.Equal("record", ed.Actions[2].Action);
+
+        var action = (ComboBox)((Grid)ed.Rows.Children[0]).Children[1];
+        action.SelectedIndex = 3;
+        Check.Equal("record", row.Action);
+    }
+
     // ------------------------------------------------------------------ the Alt-chord menu mask
 
     [UnitTest]

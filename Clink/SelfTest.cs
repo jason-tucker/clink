@@ -7,8 +7,8 @@ using Clink.Services;
 namespace Clink;
 
 /// <summary>
-/// `Clink.exe --selftest [seconds] [outFolder] [--codec h264|hevc|av1] [--quiet]`: runs the pipeline headless, saves a clip,
-/// prints what happened. The clip goes to outFolder (default: the clips folder from settings); --codec overrides the codec
+/// `Clink.exe --selftest [seconds] [outFolder] [--codec h264|hevc|av1] [--quiet] [--record]`: runs the pipeline headless, saves a clip,
+/// prints what happened. --record also records for the whole length (a clip halfway), stops, and probes both files. The clip goes to outFolder (default: the clips folder from settings); --codec overrides the codec
 /// setting; --quiet skips the click sound.
 /// </summary>
 internal static class SelfTest
@@ -88,12 +88,53 @@ internal static class SelfTest
             var st = engine.GetStats();
             Say($"  encoder {st.Encoder} ({st.Codec}), ring {Capabilities.FormatBytes(st.RingBytes)} = {st.RingSeconds}s");
         }
+        bool record = args.Any(a => a.Equals("--record", StringComparison.OrdinalIgnoreCase));
+        string? recordingPath = null, midClipPath = null;
+        if (record)
+        {
+            try
+            {
+                recordingPath = engine.StartRecording(new RecordingOptions(Path.Combine(cfg.ClipsFolder, "Recordings")));
+                Say($"Recording to {recordingPath}");
+            }
+            catch (Exception ex) { Say("RECORD START FAILED: " + ex); return 4; }
+        }
         for (int i = 0; i < seconds; i++)
         {
             Thread.Sleep(1000);
+            if (record && i == seconds / 2)
+            {
+                try
+                {
+                    var mid = engine.SaveClip(Math.Max(1, seconds / 2));
+                    midClipPath = mid.Path;
+                    Say($"Clip during the recording: {mid.Path} ({mid.DurationSeconds:0.00}s, {mid.SizeBytes / 1_048_576.0:0.0} MB)");
+                }
+                catch (Exception ex) { Say("CLIP DURING RECORDING FAILED: " + ex); return 3; }
+            }
+            if (record && engine.Recording is { } rs)
+                Say($"  recording {rs.Seconds:0.0}s written={rs.BytesWritten / 1_048_576.0:0.0} MB queue={rs.QueueBytes / 1024} KB dropped={rs.Dropped}");
             var st = engine.GetStats();
             string audio = string.Join(", ", st.Audio.Select(a => $"{a.Name}:{(a.Running ? "ok" : "off")}"));
             Say($"  t={i + 1}s capture={st.CaptureFrames} in={st.FramesIn} out={st.FramesOut} dropped={st.Dropped} buffered={st.BufferedSeconds:0.0}s game={st.Game ?? "-"} audio=[{audio}]");
+        }
+        if (record)
+        {
+            try
+            {
+                var stopTask = engine.StopRecordingAsync();
+                if (!stopTask.Wait(30_000)) { Say("RECORDING DID NOT FINISH within 30 s"); return 4; }
+                var rr = stopTask.Result;
+                Say($"Recording finished: {rr.Reason}{(rr.Error != null ? " (" + rr.Error + ")" : "")}, {rr.Path ?? "no file"}, {rr.DurationSeconds:0.00}s, {rr.SizeBytes / 1_048_576.0:0.0} MB, audio [{string.Join(", ", rr.AudioTracks)}], dropped video frames {rr.DroppedVideoFrames}");
+                foreach (var file in new[] { rr.Path, midClipPath })
+                {
+                    if (file == null) continue;
+                    Say($"--- {file}");
+                    Say(MediaProbe.Report(file));
+                }
+                if (rr.Path == null || rr.Error != null) return 4;
+            }
+            catch (Exception ex) { Say("RECORDING FAILED: " + ex); return 4; }
         }
         try
         {

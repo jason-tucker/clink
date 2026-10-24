@@ -116,8 +116,9 @@ internal sealed unsafe class Engine : IDisposable
 
     public void Stop()
     {
+        _stop = true;   // first: StartRecording refuses from here on (see DetachRecorder)
+        DetachRecorder();
         if (_videoThread == null) return;
-        _stop = true;
         _videoThread.Join(5000);
         _audioThread?.Join(3000);
         _videoThread = null;
@@ -169,7 +170,8 @@ internal sealed unsafe class Engine : IDisposable
             else
                 Log.Info($"Ring buffer {_ring.Capacity >> 20} MB for {_cfg.BufferSeconds}s at {mbps:0.#} Mbps ({_cfg.Codec}{(_cfg.Codec == "av1" ? ", experimental" : "")})");
             var ring = _ring;
-            _encoder.OnOutput = (pts, key, data) => ring.Push(pts, key, data);
+            var fan = _fan;
+            _encoder.OnOutput = (pts, key, data) => fan.Push(ring, pts, key, data);   // ring, then the recording if one runs (copy + enqueue under the gate)
 
             StartAudio();
 
@@ -231,6 +233,9 @@ internal sealed unsafe class Engine : IDisposable
         finally
         {
             _stop = true;
+            // (_stop, set first, is what keeps a recording from starting during the audio join and the teardown: StartRecording checks it
+            // under _recLock, which DetachRecorder takes. IsRunning stays true until the teardown is done: the controller relies on it.)
+            DetachRecorder();   // before anything is torn down; the recording finishes on its own thread
             if (!timer.IsNull) PInvoke.CloseHandle(timer);
             try { _audioThread?.Join(3000); } catch { }
             TearDown();
@@ -288,6 +293,7 @@ internal sealed unsafe class Engine : IDisposable
         {
             foreach (var t in _tracks) { try { t.Dispose(); } catch { } }
             _tracks.Clear();
+            _taps.Clear();
             _gameTrack = _voiceTrack = null;
             _gameIsDevice = _voiceIsDevice = false;
         }
@@ -572,9 +578,274 @@ internal sealed unsafe class Engine : IDisposable
         return s.Length > 40 ? s[..40] : s;
     }
 
+    /// <summary>
+    /// Stops the engine and waits up to 15 s for a recording in flight to finish its file. A disk write that hangs cannot be interrupted:
+    /// after the wait the recording is left to its thread (and to <see cref="RecoverRecordings"/> at the next start). Do not call it from
+    /// a thread that a <see cref="RecordingStopped"/> handler waits on (a handler that does Dispatcher.Invoke while Dispose blocks the UI
+    /// thread stalls for the full 15 s).
+    /// </summary>
     public void Dispose()
     {
         Stop();
+        // A recording in flight finishes on its own thread (a moov and a rename: fast); give it time before the process goes on.
+        var sink = _sink;
+        if (sink != null)
+        {
+            try { sink.Completion.Wait(15000); } catch { }
+        }
         _ready.Dispose();
+    }
+
+    // ------------------------------------------------------------------ recording
+
+    private readonly VideoFanOut _fan = new();
+    private readonly object _recLock = new();
+    private RecordingSink? _sink;              // the recording that has not finished yet (cleared by its writer thread)
+    private Task<RecordingResult>? _lastRecording;
+
+    /// <summary>A recording is running or finishing.</summary>
+    public bool IsRecording => Volatile.Read(ref _sink) != null;
+
+    /// <summary>Live numbers of the recording (any thread), or null.</summary>
+    public RecordingStatus? Recording => Volatile.Read(ref _sink)?.Status;
+
+    /// <summary>Raised on the recording's writer thread for every end, whatever the reason (a stop, a limit, an engine restart, a failure). Handlers must not wait for <see cref="StopRecordingAsync"/>.</summary>
+    public event Action<RecordingResult>? RecordingStopped;
+
+    private const long MinFreeBytes = 1L << 30;
+
+    /// <summary>
+    /// Starts recording from the replay ring's last keyframe (at most one GOP of pre-roll). Returns the file the recording will become
+    /// ("&lt;Folder&gt;\&lt;game or Recording&gt; yyyy-MM-dd HH-mm-ss.mp4"; the data goes to that name + ".rec" until it is finished).
+    /// Throws when the engine is not running, a recording is already going, or the disk has less than 1 GB free.
+    /// </summary>
+    public string StartRecording(RecordingOptions options, string? gameHint = null)
+    {
+        if (_stop || !IsRunning || _ring == null || _encoder == null) throw new InvalidOperationException("Not recording: the engine is not running");
+        if (IsRecording) throw new InvalidOperationException("Already recording");
+        // The file-system work first, outside the lock: a slow folder (a network share) must not hold up DetachRecorder.
+        string folder = Path.GetFullPath(options.Folder);
+        Directory.CreateDirectory(folder);
+        long free = FreeBytes(folder);
+        if (free >= 0 && free < MinFreeBytes) throw new IOException($"Not enough free disk space to record ({free / 1_048_576} MB free, 1024 MB needed)");
+
+        string game = _gameName ?? (string.IsNullOrEmpty(gameHint) ? "" : gameHint);
+        string baseName = string.IsNullOrEmpty(game) ? "Recording" : SanitizeName(game);
+        string stamp = $"{baseName} {DateTime.Now:yyyy-MM-dd HH-mm-ss}";
+        string path = Path.Combine(folder, stamp + ".mp4");
+        int n = 1;
+        while (File.Exists(path) || File.Exists(path + ".rec") || File.Exists(Mp4Muxer.JournalPath(path + ".rec"))) path = Path.Combine(folder, $"{stamp} ({n++}).mp4");
+
+        lock (_recLock)
+        {
+            var ring = _ring; var enc = _encoder;
+            if (_stop || !IsRunning || ring == null || enc == null) throw new InvalidOperationException("Not recording: the engine is not running");
+            if (IsRecording) throw new InvalidOperationException("Already recording");
+
+            List<AudioTrack> tracks;
+            List<AudioTrackDesc> descs;
+            lock (_audioGate)
+            {
+                tracks = _tracks.Where(t => t.Enabled).ToList();
+                descs = tracks.Select(t => new AudioTrackDesc { Name = t.Name, AudioSpecificConfig = t.AudioSpecificConfig, Bitrate = t.Bitrate, SampleRate = AudioTrack.Rate, Channels = 2 }).ToList();
+            }
+            var cfg = new RecordingSinkConfig
+            {
+                InProgressPath = path + ".rec",
+                FinalPath = path,
+                Video = new ClipVideoConfig(enc.Codec, (int)_cfg.OutWidth, (int)_cfg.OutHeight, _cfg.Fps, enc.SequenceHeader),
+                Audio = descs,
+                BitrateMbps = _cfg.BitrateMbps,
+                MaxDuration = options.MaxDuration ?? TimeSpan.FromHours(4),
+                MaxBytes = options.MaxBytes,
+                Game = string.IsNullOrEmpty(game) ? null : game,
+                FreeSpace = () => FreeBytes(folder) is var f && f >= 0 ? f : long.MaxValue,
+                SequenceHeaderProvider = () => enc.SequenceHeader,
+                Detach = DetachTaps,
+                Completed = OnRecordingDone,
+            };
+            var sink = new RecordingSink(cfg);   // (its thread starts below, once it is stored and attached)
+            _sink = sink;
+            try
+            {
+                // Atomic starts: each producer's gate is held while its snapshot is fed and its tap attached (the video first, whose
+                // first keyframe says where the audio window begins).
+                long from = _fan.Attach(ring, sink) ?? ComUtil.QpcNow100ns();
+                lock (_audioGate)
+                {
+                    for (int i = 0; i < tracks.Count; i++)
+                    {
+                        int index = i;
+                        Action<AacFrame> tap = live => sink.OnAudio(index, live);
+                        _taps.Add((sink, tracks[i], tap));
+                        foreach (var past in tracks[i].AttachTap(from, tap)) sink.OnAudio(index, past);
+                    }
+                }
+                sink.Start();
+            }
+            catch
+            {
+                Interlocked.CompareExchange(ref _sink, null, sink);   // (so that no event is raised for the attempt)
+                DetachTaps(sink);
+                sink.Abort();   // no file, whatever was fed
+                throw;
+            }
+            Log.Info($"Recording started: {path} ({descs.Count} audio tracks, {enc.Codec})");
+            return path;
+        }
+    }
+
+    /// <summary>
+    /// Ends the recording; completes when the file is finished (or recovered). Calling it again returns the same task; with no recording at
+    /// all it faults. A disk write that hangs cannot be interrupted, so the task may take as long as the disk does; do not block a UI thread
+    /// on it. <see cref="RecordingStopped"/> is raised on the recorder thread, before the task completes: its handlers must not block, nor
+    /// Invoke synchronously onto a thread that may be waiting for this task or for <see cref="Dispose"/>.
+    /// </summary>
+    public Task<RecordingResult> StopRecordingAsync()
+    {
+        var sink = Volatile.Read(ref _sink);
+        if (sink != null)
+        {
+            sink.Stop(RecordingEndReason.UserStopped);
+            return sink.Completion;
+        }
+        return _lastRecording ?? Task.FromException<RecordingResult>(new InvalidOperationException("Not recording"));
+    }
+
+    private void OnRecordingDone(RecordingSink sink, RecordingResult result)
+    {
+        Log.Info($"Recording ended: {result.Reason}{(result.Error != null ? " (" + result.Error + ")" : "")}, {result.Path ?? "no file"}, {result.DurationSeconds:0.0}s, {result.SizeBytes / 1_048_576.0:0.0} MB, dropped video {result.DroppedVideoFrames}");
+        if (Interlocked.CompareExchange(ref _sink, null, sink) != sink) return;
+        _lastRecording = sink.Completion;
+        try { RecordingStopped?.Invoke(result); } catch (Exception ex) { Log.Warn("RecordingStopped handler: " + ex.Message); }
+    }
+
+    private readonly List<(RecordingSink owner, AudioTrack track, Action<AacFrame> tap)> _taps = new();   // guarded by _audioGate
+
+    private void DetachTaps(RecordingSink sink)
+    {
+        _fan.Detach(sink);
+        lock (_audioGate)
+        {
+            for (int i = _taps.Count - 1; i >= 0; i--)
+            {
+                var (owner, track, tap) = _taps[i];
+                if (owner != sink) continue;
+                if (track.FrameTap == tap) track.FrameTap = null;   // (only this recording's own tap)
+                _taps.RemoveAt(i);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The engine goes away (stop, restart, a failure): detach and let the recording finish by itself. Does not wait. Runs under the
+    /// recording lock, so it cannot interleave with a <see cref="StartRecording"/>: that one either finishes first (and is detached here) or
+    /// sees <c>_stop</c> and refuses.
+    /// </summary>
+    private void DetachRecorder()
+    {
+        lock (_recLock)
+        {
+            var sink = Volatile.Read(ref _sink);
+            if (sink == null) return;
+            DetachTaps(sink);
+            sink.Stop(RecordingEndReason.EngineStopped, catchUp: false);
+        }
+    }
+
+    private static long FreeBytes(string folder)
+    {
+        try { return new DriveInfo(Path.GetPathRoot(folder)!).AvailableFreeSpace; }
+        catch { return -1; }
+    }
+
+    private const int HeaderOnlyBytes = 512;
+
+    /// <summary>
+    /// Startup: finishes the recordings an earlier run left in <paramref name="folder"/> (*.rec with its .idx journal) and cleans up what is
+    /// no use: a journal without its recording, a recording that holds only the file head. A recording another process has open is skipped;
+    /// one that cannot be recovered is kept and reported. Call it off the UI thread, before the first recording of this run.
+    /// </summary>
+    public static IReadOnlyList<RecordingResult> RecoverRecordings(string folder)
+    {
+        var results = new List<RecordingResult>();
+        if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder)) return results;
+        string[] files;
+        try { files = Directory.GetFiles(folder); }
+        catch (Exception ex) { Log.Warn("Recover recordings: " + ex.Message); return results; }
+        foreach (string rec in files.Where(f => f.EndsWith(".rec", StringComparison.OrdinalIgnoreCase)).OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
+        {
+            string idx = Mp4Muxer.JournalPath(rec);
+            string final = rec[..^4];
+            RecordingResult Fail(string why) => new(null, 0, 0, null, Array.Empty<string>(), RecordingEndReason.Unrecoverable, why, 0);
+            try
+            {
+                if (!File.Exists(idx))
+                {
+                    // Only the head: a recording that died before its journal (or one that is being made right now: leave the young ones).
+                    // Only ours: a file with some other content under this name is not touched.
+                    var info = new FileInfo(rec);
+                    if (info.Length <= HeaderOnlyBytes && IsOld(info) && HasFtypHead(rec)) File.Delete(rec);
+                    continue;
+                }
+                var state = Mp4Muxer.InspectJournal(idx, out long dataStart);
+                if (state == Mp4Muxer.JournalState.NotAJournal)
+                {
+                    results.Add(Fail($"Could not recover {rec}: the journal is not one of ours; the files are kept"));
+                    continue;
+                }
+                if (state == Mp4Muxer.JournalState.Empty)
+                {
+                    // Killed in its first second: the journal has its header and not one sample, the recording only its head. Nothing to save.
+                    var info = new FileInfo(rec);
+                    if (!IsOld(info) || !IsOld(new FileInfo(idx))) continue;   // (being made right now, perhaps)
+                    if (info.Length <= dataStart + EmptyRecordingSlackBytes && HasFtypHead(rec))
+                    {
+                        File.Delete(rec);   // first: a recording that is live fails here (sharing violation) and keeps its journal
+                        File.Delete(idx);
+                        Log.Info($"Removed an empty recording: {rec}");
+                    }
+                    else results.Add(Fail($"Could not recover {rec}: its journal is empty but the recording is not; the files are kept"));
+                    continue;
+                }
+                var r = Mp4Muxer.Recover(rec, idx, final);
+                if (r != null)
+                    results.Add(new RecordingResult(r.Path, r.Duration100ns / 10_000_000.0, r.SizeBytes, null, r.AudioTracks, RecordingEndReason.Recovered, null, 0));
+                else
+                    results.Add(Fail($"Could not recover {rec}; the files are kept"));
+            }
+            catch (IOException ex) when (ex.HResult is unchecked((int)0x80070020) or unchecked((int)0x80070021))
+            {
+                /* in use (another instance records into it): not ours */
+            }
+            catch (FileNotFoundException) { /* gone since the listing (finished or removed by someone else): nothing to do */ }
+            catch (Exception ex)
+            {
+                Log.Warn($"Recover {rec}: {ex.Message}");
+                results.Add(Fail($"Could not recover {rec}: {ex.Message}"));
+            }
+        }
+        foreach (string idx in files.Where(f => f.EndsWith(".rec.idx", StringComparison.OrdinalIgnoreCase)))
+        {
+            try
+            {
+                if (!File.Exists(idx)) continue;   // (the pass above may have finished or removed it)
+                if (!File.Exists(idx[..^4]) && Mp4Muxer.HasJournalMagic(idx)) File.Delete(idx);
+            }
+            catch (Exception ex) { Log.Warn($"Delete {idx}: {ex.Message}"); }
+        }
+        return results;
+    }
+
+    private const int EmptyRecordingSlackBytes = 4096;
+
+    private static bool IsOld(FileInfo info) => DateTime.UtcNow - info.LastWriteTimeUtc > TimeSpan.FromSeconds(10);
+
+    /// <summary>The file starts like one of ours: an ftyp box.</summary>
+    private static bool HasFtypHead(string path)
+    {
+        using var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        Span<byte> h = stackalloc byte[8];
+        return f.ReadAtLeast(h, 8, throwOnEndOfStream: false) == 8 && h.Slice(4).SequenceEqual("ftyp"u8);
     }
 }
